@@ -1,0 +1,56 @@
+name: Daily Toss Trader Report
+
+on:
+  schedule:
+    - cron: "31 23 * * *"
+  workflow_dispatch:
+
+jobs:
+  analyze-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade requests
+
+      - name: Create runtime environment
+        env:
+          TOSS_CLIENT_ID: ${{ secrets.TOSS_CLIENT_ID }}
+          TOSS_CLIENT_SECRET: ${{ secrets.TOSS_CLIENT_SECRET }}
+        run: |
+          printf 'TOSS_CLIENT_ID=%s\nTOSS_CLIENT_SECRET=%s\n' \
+            "$TOSS_CLIENT_ID" "$TOSS_CLIENT_SECRET" > .env
+
+      - name: Run analysis
+        id: analysis
+        run: |
+          python 국적개선1.py > toss-trader-result.txt 2>&1
+
+      - name: Send result to Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ ! -f toss-trader-result.txt ]; then
+            printf '분석 실행 결과 파일이 생성되지 않았습니다.\n' > toss-trader-result.txt
+          fi
+          curl --fail --silent --show-error \
+            -X POST \
+            -F "chat_id=${TELEGRAM_CHAT_ID}" \
+            -F "caption=토스증권 분석 결과 ($(date -u '+%Y-%m-%d %H:%M UTC'))" \
+            -F "document=@toss-trader-result.txt;filename=toss-trader-result.txt" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument"
+
+      - name: Remove runtime secrets
+        if: always()
+        run: rm -f .env
