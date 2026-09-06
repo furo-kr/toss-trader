@@ -163,15 +163,21 @@ def main():
             continue
         articles.append((url, post["title"]))
 
+    digest = ["📊 해외주식갤러리 1시간 이슈 모음", ""]
     for url, title in articles[:10]:
         summary = extract_summary(url)
-        send_telegram(
-            "📌 해외주식갤러리 새 글\n"
-            f"제목: {title}\n"
-            f"요약: {summary}\n"
-            f"원문: {url}"
+        digest.extend(
+            [
+                f"• {title}",
+                f"  {summary}",
+                f"  {url}",
+                "",
+            ]
         )
         seen.add(url)
+
+    if articles:
+        send_telegram("\n".join(digest))
 
     save_seen(seen)
     print(f"새 글 {len(articles[:10])}개 처리")
