@@ -13,6 +13,17 @@ GALLERY_URL = (
 )
 STATE_PATH = os.getenv("DCINSIDE_STATE_PATH", "dcinside-seen.json")
 USER_AGENT = "Mozilla/5.0 (compatible; TossTraderNews/1.0)"
+QUALITY_KEYWORDS = (
+    "주식", "증시", "시장", "실적", "매출", "영업이익", "뉴스",
+    "차트", "분석", "매매", "타점", "전략", "수급", "금리",
+    "채권", "환율", "달러", "국채", "반도체", "ai", "etf",
+    "ipo", "공시", "sec", "fomc", "fed",
+)
+QUALITY_PREFIXES = ("💡정보", "📋분석", "정보", "분석")
+NOISE_KEYWORDS = (
+    "뻘", "헛소", "일상", "친목", "탈갤", "저녁", "점심", "굿모닝",
+    "날씨", "여행", "웹툰", "졸업", "인생", "연애",
+)
 
 
 class TextParser(HTMLParser):
@@ -123,6 +134,16 @@ def normalize_url(href):
     return urllib.parse.urljoin(GALLERY_URL, href.split("&page=")[0])
 
 
+def is_quality_post(title, summary=""):
+    text = f"{title} {summary}".lower()
+    if any(keyword in text for keyword in NOISE_KEYWORDS):
+        return False
+    return (
+        title.startswith(QUALITY_PREFIXES)
+        or any(keyword in text for keyword in QUALITY_KEYWORDS)
+    )
+
+
 def extract_summary(article_url):
     page = fetch(article_url)
     parser = ContentParser()
@@ -161,11 +182,18 @@ def main():
         url = normalize_url(post["href"])
         if url in seen or "board/view" not in url:
             continue
+        if not is_quality_post(post["title"]):
+            seen.add(url)
+            continue
         articles.append((url, post["title"]))
 
     digest = ["📊 해외주식갤러리 1시간 이슈 모음", ""]
+    processed_count = 0
     for url, title in articles[:10]:
         summary = extract_summary(url)
+        if not is_quality_post(title, summary):
+            seen.add(url)
+            continue
         digest.extend(
             [
                 f"• {title}",
@@ -175,12 +203,13 @@ def main():
             ]
         )
         seen.add(url)
+        processed_count += 1
 
-    if articles:
+    if processed_count:
         send_telegram("\n".join(digest))
 
     save_seen(seen)
-    print(f"새 글 {len(articles[:10])}개 처리")
+    print(f"양질의 새 글 {processed_count}개 처리")
 
 
 if __name__ == "__main__":
