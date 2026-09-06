@@ -2,7 +2,8 @@ name: DCInside Overseas Stock Summary
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    # GitHub Actions cron is UTC; 22-14 UTC = 07:00-23:00 KST.
+    - cron: "0 0-14,22-23 * * *"
   workflow_dispatch:
 
 jobs:

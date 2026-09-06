@@ -4,6 +4,7 @@ import os
 import re
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 
 
@@ -173,6 +174,11 @@ def send_telegram(message):
 
 
 def main():
+    kst = timezone(timedelta(hours=9))
+    if datetime.now(kst).hour < 7:
+        print("한국시간 00:00~06:59에는 텔레그램 전송을 하지 않습니다.")
+        return
+
     parser = ArticleParser()
     parser.feed(fetch(GALLERY_URL))
     seen = load_seen()
