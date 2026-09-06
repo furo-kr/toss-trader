@@ -4,6 +4,8 @@ import os
 import re
 import urllib.parse
 import urllib.request
+import urllib.error
+import time
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 
@@ -103,19 +105,33 @@ class ArticleParser(HTMLParser):
                 self.capture = False
 
 
-def fetch(url):
+def fetch(url, attempts=3):
     request = urllib.request.Request(
         url,
         headers={"User-Agent": USER_AGENT},
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        body = response.read()
-        for encoding in ("utf-8", "euc-kr"):
-            try:
-                return body.decode(encoding)
-            except UnicodeDecodeError:
-                continue
-        return body.decode("utf-8", errors="replace")
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                body = response.read()
+                for encoding in ("utf-8", "euc-kr"):
+                    try:
+                        return body.decode(encoding)
+                    except UnicodeDecodeError:
+                        continue
+                return body.decode("utf-8", errors="replace")
+        except (urllib.error.URLError, TimeoutError) as error:
+            last_error = error
+            if attempt + 1 == attempts:
+                break
+            delay = 2 ** attempt
+            print(
+                f"접속 재시도 {attempt + 1}/{attempts - 1}: "
+                f"{delay}초 후 재시도 ({error})"
+            )
+            time.sleep(delay)
+    raise RuntimeError(f"페이지 조회 실패({attempts}회 시도): {url}") from last_error
 
 
 def load_seen():
