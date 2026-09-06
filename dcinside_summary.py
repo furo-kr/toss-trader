@@ -64,45 +64,34 @@ class ContentParser(HTMLParser):
         return re.sub(r"\s+", " ", html.unescape(" ".join(self.parts))).strip()
 
 
-class ArticleParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.posts = []
-        self.current = None
-        self.capture = False
+ROW_RE = re.compile(r'<tr class="ub-content[^"]*"([^>]*)>(.*?)</tr>', re.S)
+LINK_RE = re.compile(r'<a\s+href="([^"]*/board/view/[^"]*)"[^>]*>(.*?)</a>', re.S)
+DATE_RE = re.compile(r'class="gall_date" title="([^"]+)"')
 
-    def handle_starttag(self, tag, attrs):
-        attributes = dict(attrs)
-        classes = attributes.get("class", "").split()
-        href = attributes.get("href", "")
-        if (
-            tag == "a"
-            and href
-            and "/board/view" in href
-            and "t=cv" not in href
-        ):
-            self.current = {"href": href, "title": []}
-            self.capture = True
-        elif self.current and tag in ("span", "em", "a"):
-            self.capture = True
 
-    def handle_data(self, data):
-        if self.current and self.capture:
-            self.current["title"].append(data)
-
-    def handle_endtag(self, tag):
-        if self.current and tag == "a":
-            title = re.sub(
-                r"\s+",
-                " ",
-                html.unescape(" ".join(self.current["title"])),
-            ).strip()
-            if title:
-                self.current["title"] = title
-                self.posts.append(self.current)
-            if "/board/view" in self.current["href"]:
-                self.current = None
-                self.capture = False
+def parse_posts(page_html):
+    """목록 페이지에서 (href, title, 작성시각) 목록을 추출한다."""
+    posts = []
+    for row_attrs, row_body in ROW_RE.findall(page_html):
+        if 'data-type="icon_notice"' in row_attrs:
+            continue  # 상단 고정 공지글은 제외
+        link_match = LINK_RE.search(row_body)
+        date_match = DATE_RE.search(row_body)
+        if not link_match or not date_match:
+            continue
+        href = link_match.group(1)
+        if "t=cv" in href:
+            continue
+        title_html = link_match.group(2)
+        title = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", title_html))).strip()
+        if not title:
+            continue
+        try:
+            posted_at = datetime.strptime(date_match.group(1), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        posts.append({"href": href, "title": title, "posted_at": posted_at})
+    return posts
 
 
 def fetch(url, attempts=3):
@@ -189,36 +178,66 @@ def send_telegram(message):
             raise RuntimeError(f"Telegram response: {response.status}")
 
 
+MAX_ARTICLES = 15
+MAX_LIST_PAGES = 5
+
+
+def collect_window_posts(window_start, window_end):
+    """window_start < 작성시각 <= window_end 인 게시글을 목록 페이지를 넘겨가며 수집한다."""
+    collected = []
+    seen_hrefs = set()
+    for page_no in range(1, MAX_LIST_PAGES + 1):
+        page_html = fetch(f"{GALLERY_URL}&page={page_no}")
+        posts = parse_posts(page_html)
+        if not posts:
+            break
+        reached_older = False
+        for post in posts:
+            posted_at = post["posted_at"]
+            if posted_at > window_end:
+                continue
+            if posted_at <= window_start:
+                reached_older = True
+                continue
+            url = normalize_url(post["href"])
+            if url in seen_hrefs:
+                continue
+            seen_hrefs.add(url)
+            collected.append((url, post["title"], posted_at))
+        if reached_older:
+            break
+    collected.sort(key=lambda item: item[2])
+    return collected
+
+
 def main():
     kst = timezone(timedelta(hours=9))
-    if datetime.now(kst).hour < 7:
-        print("한국시간 00:00~06:59에는 텔레그램 전송을 하지 않습니다.")
-        return
+    now_kst = datetime.now(kst).replace(tzinfo=None)
+    window_end = now_kst
+    window_start = (now_kst - timedelta(days=1)).replace(hour=22, minute=30, second=0, microsecond=0)
 
-    parser = ArticleParser()
-    parser.feed(fetch(GALLERY_URL))
+    posts = collect_window_posts(window_start, window_end)
     seen = load_seen()
-    articles = []
 
-    for post in parser.posts:
-        url = normalize_url(post["href"])
-        if url in seen or "board/view" not in url:
+    digest = [
+        "📊 해외주식갤러리 밤사이 이슈 모음",
+        f"({window_start.strftime('%m/%d %H:%M')} ~ {window_end.strftime('%m/%d %H:%M')})",
+        "",
+    ]
+    processed_count = 0
+    for url, title, posted_at in posts[:MAX_ARTICLES]:
+        if url in seen:
             continue
-        if not is_quality_post(post["title"]):
+        if not is_quality_post(title):
             seen.add(url)
             continue
-        articles.append((url, post["title"]))
-
-    digest = ["📊 해외주식갤러리 1시간 이슈 모음", ""]
-    processed_count = 0
-    for url, title in articles[:10]:
         summary = extract_summary(url)
         if not is_quality_post(title, summary):
             seen.add(url)
             continue
         digest.extend(
             [
-                f"• {title}",
+                f"• [{posted_at.strftime('%H:%M')}] {title}",
                 f"  {summary}",
                 f"  {url}",
                 "",
@@ -229,6 +248,8 @@ def main():
 
     if processed_count:
         send_telegram("\n".join(digest))
+    else:
+        print("전송할 만한 양질의 글이 없습니다.")
 
     save_seen(seen)
     print(f"양질의 새 글 {processed_count}개 처리")
