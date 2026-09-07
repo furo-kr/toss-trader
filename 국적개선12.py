@@ -1,8 +1,16 @@
+import math
 import os
+import re
+import sys
 import time
+import unicodedata
 import requests
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
 BASE_URL = "https://openapi.tossinvest.com"
@@ -21,11 +29,283 @@ ENV_PATH = os.path.join(PROJECT_DIR, ".env")
 # ============================================================
 
 RED = "\033[91m"
+BOLD = "\033[1m"
 RESET = "\033[0m"
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def red_text(text):
     return f"{RED}{text}{RESET}"
+
+
+def alert_text(text):
+    return f"{RED}{BOLD}{text}{RESET}"
+
+
+SEC_HEADERS = {
+    "User-Agent": "toss-trader research contact",
+    "Accept-Encoding": "gzip, deflate",
+}
+SEC_TICKERS = None
+
+
+def get_sec_ticker_map():
+    global SEC_TICKERS
+    if SEC_TICKERS is not None:
+        return SEC_TICKERS
+
+    response = requests.get(
+        "https://www.sec.gov/files/company_tickers.json",
+        headers=SEC_HEADERS,
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    SEC_TICKERS = {
+        str(item["ticker"]).upper(): str(item["cik_str"]).zfill(10)
+        for item in data.values()
+        if item.get("ticker") and item.get("cik_str")
+    }
+    return SEC_TICKERS
+
+
+def get_yahoo_quote(symbol):
+    response = requests.get(
+        f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}",
+        params={
+            "modules": (
+                "price,summaryDetail,defaultKeyStatistics,"
+                "financialData,assetProfile,calendarEvents"
+            )
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    result = response.json()["quoteSummary"]["result"]
+    if not result:
+        return {}
+    return result[0]
+
+
+def yahoo_value(value):
+    if isinstance(value, dict):
+        return value.get("raw")
+    return value
+
+
+def get_yahoo_history(symbol):
+    response = requests.get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        params={"range": "1y", "interval": "1d", "events": "history"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    result = response.json()["chart"]["result"]
+    if not result:
+        return []
+    quote = result[0]["indicators"]["quote"][0]
+    closes = quote.get("close", [])
+    timestamps = result[0].get("timestamp", [])
+    volumes = quote.get("volume", [])
+    return [
+        (
+            datetime.fromtimestamp(timestamp, timezone.utc),
+            close,
+            volume,
+        )
+        for timestamp, close, volume in zip(timestamps, closes, volumes)
+        if close is not None
+    ]
+
+
+def get_sec_filings(symbol):
+    cik = get_sec_ticker_map().get(symbol.upper())
+    if not cik:
+        return []
+    response = requests.get(
+        f"https://data.sec.gov/submissions/CIK{cik}.json",
+        headers=SEC_HEADERS,
+        timeout=15,
+    )
+    response.raise_for_status()
+    recent = response.json().get("filings", {}).get("recent", {})
+    filings = []
+    for index, form in enumerate(recent.get("form", [])):
+        filings.append({
+            "form": form,
+            "filed": recent.get("filingDate", [""])[index],
+            "description": recent.get("primaryDocument", [""])[index],
+            "accession": recent.get("accessionNumber", [""])[index],
+        })
+    return filings
+
+
+def percent_change(history, days):
+    if len(history) <= days:
+        return None
+    old = history[-days - 1][1]
+    new = history[-1][1]
+    if not old:
+        return None
+    return (new - old) / old * 100
+
+
+def enrich_cayman_item(item):
+    symbol = item["symbol"]
+    detail = {
+        "week_change": None,
+        "month_change": None,
+        "market_cap": None,
+        "sector": "확인불가",
+        "industry": "확인불가",
+        "listing_date": None,
+        "runway": "확인불가",
+        "offerings": [],
+        "reverse_split": None,
+        "delisting_warning": False,
+        "legal_issue": None,
+        "half_move": False,
+        "david_lazar": False,
+        "adr": "(ADR)" in str(item.get("name", "")).upper(),
+        "rename": False,
+        "previous_volume": None,
+    }
+    try:
+        quote = get_yahoo_quote(symbol)
+        price = quote.get("price", {})
+        summary = quote.get("summaryDetail", {})
+        financial = quote.get("financialData", {})
+        profile = quote.get("assetProfile", {})
+        detail["market_cap"] = yahoo_value(price.get("marketCap"))
+        detail["sector"] = profile.get("sector") or "확인불가"
+        detail["industry"] = profile.get("industry") or "확인불가"
+        cash = yahoo_value(financial.get("totalCash"))
+        burn = yahoo_value(financial.get("operatingCashflow"))
+        if cash is not None and burn is not None and burn < 0:
+            detail["runway"] = f"{cash / abs(burn) * 4:.1f}분기"
+    except (requests.RequestException, KeyError, TypeError, ValueError) as error:
+        print(f"  ⚠ {symbol} Yahoo 자료 조회 실패: {error}")
+
+    try:
+        history = get_yahoo_history(symbol)
+        detail["week_change"] = percent_change(history, 5)
+        detail["month_change"] = percent_change(history, 21)
+        if history:
+            detail["listing_date"] = history[0][0].date().isoformat()
+        if len(history) >= 2:
+            detail["previous_volume"] = history[-2][2]
+        for index in range(max(1, len(history) - 3), len(history)):
+            previous = history[index - 1][1]
+            current = history[index][1]
+            if previous and (current - previous) / previous >= 0.5:
+                detail["half_move"] = True
+                break
+    except (requests.RequestException, KeyError, TypeError, ValueError) as error:
+        print(f"  ⚠ {symbol} 가격 이력 조회 실패: {error}")
+
+    try:
+        filings = get_sec_filings(symbol)
+        recent_filings = [
+            filing for filing in filings
+            if filing["filed"] >= (
+                datetime.now(timezone.utc).date() - timedelta(days=180)
+            ).isoformat()
+        ]
+        offering_forms = {
+            "S-1", "S-3", "F-1", "F-3", "424B2", "424B3", "424B4",
+            "424B5", "8-K", "6-K", "ATM",
+        }
+        detail["offerings"] = [
+            filing for filing in recent_filings
+            if filing["form"] in offering_forms
+        ]
+        detail["reverse_split"] = any(
+            "reverse" in filing["description"].lower()
+            or "split" in filing["description"].lower()
+            for filing in recent_filings
+        )
+        detail["delisting_warning"] = any(
+            filing["form"] in {"NT 10-K", "NT 10-Q"}
+            or "delist" in filing["description"].lower()
+            for filing in recent_filings
+        )
+        legal_filings = [
+            filing for filing in recent_filings
+            if any(
+                keyword in filing["description"].lower()
+                for keyword in ("litig", "lawsuit", "penalt", "fine", "complaint")
+            )
+        ]
+        if legal_filings:
+            detail["legal_issue"] = (
+                f"관련 키워드 공시 {len(legal_filings)}건"
+            )
+        detail["david_lazar"] = any(
+            "lazar" in filing["description"].lower()
+            for filing in recent_filings
+        )
+        detail["rename"] = any(
+            "name" in filing["description"].lower()
+            or "amend" in filing["description"].lower()
+            for filing in recent_filings
+        )
+    except (requests.RequestException, KeyError, TypeError, ValueError) as error:
+        print(f"  ⚠ {symbol} SEC 자료 조회 실패: {error}")
+
+    return detail
+
+
+def format_stock_name(name):
+    return re.sub(
+        r"\(ADR\)",
+        lambda match: red_text(match.group(0)),
+        str(name),
+        flags=re.IGNORECASE,
+    )
+
+
+def display_width(value):
+    width = 0
+
+    for char in ANSI_ESCAPE_RE.sub("", str(value)):
+        if unicodedata.combining(char):
+            continue
+
+        width += (
+            2
+            if unicodedata.east_asian_width(char) in ("W", "F")
+            else 1
+        )
+
+    return width
+
+
+def fit_cell(value, width, align="left"):
+    text = str(value)
+    visible_width = display_width(text)
+
+    if visible_width > width:
+        result = []
+        current_width = 0
+
+        for char in text:
+            char_width = display_width(char)
+
+            if current_width + char_width > width:
+                break
+
+            result.append(char)
+            current_width += char_width
+
+        text = "".join(result)
+        visible_width = current_width
+
+    padding = " " * max(0, width - visible_width)
+
+    if align == "right":
+        return padding + text
+
+    return text + padding
 
 
 # ============================================================
@@ -88,6 +368,910 @@ def load_env_file():
     return True
 
 
+def get_0859_candle(token, symbol, target_time):
+    search_time = target_time.replace(hour=8, minute=59, second=0)
+    candle = get_0830_candle(
+        token,
+        symbol,
+        search_time,
+        max_fallback=0,
+    )
+    if candle:
+        return candle.get("close")
+    return None
+
+
+def get_0900_open(token, symbol, target_time):
+    search_time = target_time.replace(hour=9, minute=0, second=0)
+    candle = get_0830_candle(
+        token,
+        symbol,
+        search_time,
+        max_fallback=0,
+    )
+    if candle:
+        return candle.get("open")
+    return None
+
+
+def send_drop_alert(results, token, target_time):
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not bot_token or not chat_id:
+        print("❌ 텔레그램 설정이 없습니다.")
+        print("   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID를 .env에 추가하세요.")
+        return
+
+    drops = []
+    for item in results:
+        reference_price = item.get("reference_price")
+        if reference_price is None or reference_price == 0:
+            continue
+
+        close_0859 = get_0859_candle(
+            token,
+            item["symbol"],
+            target_time,
+        )
+        open_0900 = get_0900_open(
+            token,
+            item["symbol"],
+            target_time,
+        )
+        if close_0859 is None or open_0900 is None:
+            continue
+
+        close_change_percent = (
+            (close_0859 - reference_price)
+            / reference_price
+            * 100
+        )
+        open_change_percent = (
+            (open_0900 - reference_price)
+            / reference_price
+            * 100
+        )
+        if (
+            -1 <= close_change_percent <= 1
+            and open_change_percent <= -4
+        ):
+            alert_item = dict(item)
+            alert_item["current_price"] = open_0900
+            alert_item["change_percent"] = open_change_percent
+            alert_item["close_0859"] = close_0859
+            alert_item["close_change_percent"] = close_change_percent
+            drops.append(alert_item)
+
+    drops.sort(key=lambda item: item["change_percent"])
+
+    if drops:
+        lines = ["📉 08:59 종가 ±1% + 09:00 시작가 -4% 이하 신호", ""]
+        for item in drops:
+            lines.append(
+                f"{item['symbol']} | {item['name']} | "
+                f"09:00 시작 {item['change_percent']:.2f}% | "
+                f"08:59 종가 {item['close_change_percent']:+.2f}% | "
+                f"기준가 {fmt_price(item['reference_price'])} | "
+                f"시작가 {fmt_price(item['current_price'])}"
+            )
+    else:
+        lines = ["📉 08:59 종가 ±1% + 09:00 시작가 -4% 이하 신호 없음"]
+
+    response = requests.post(
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        data={
+            "chat_id": chat_id,
+            "text": "\n".join(lines),
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    print(f"✅ 텔레그램 전송 완료: {len(drops)}개")
+
+
+def print_cayman_report(results):
+    cayman_items = [
+        item
+        for item in results
+        if "케이맨제도" in str(item.get("country", ""))
+    ]
+    for item in cayman_items:
+        print(f"외부자료 조사 중: {item['symbol']}")
+        item["external"] = enrich_cayman_item(item)
+
+    cayman_items.sort(
+        key=lambda item: item.get("change_percent")
+        if item.get("change_percent") is not None
+        else -999,
+        reverse=True,
+    )
+
+    lines = [
+        alert_text("🇰🇾 케이맨제도 종목 상세 분석"),
+        "출처: Yahoo Finance 공개 시세/기업정보 + SEC 최근 공시(최근 180일)",
+        "",
+    ]
+    if not cayman_items:
+        lines.append("거래량 TOP100 내 케이맨제도 종목 없음")
+    else:
+        for item in cayman_items:
+            detail = item["external"]
+            change = item.get("change_percent")
+            change_text = (
+                f"{change:+.2f}%"
+                if change is not None
+                else "-"
+            )
+            market_cap = detail.get("market_cap")
+            if market_cap is None:
+                market_cap_text = "확인불가"
+            elif market_cap < 300_000_000:
+                market_cap_text = alert_text(
+                    f"${market_cap / 1_000_000:.1f}M (마이크로캡)"
+                )
+            else:
+                market_cap_text = f"${market_cap / 1_000_000:.1f}M"
+
+            offering_text = (
+                alert_text(
+                    f"있음 ({len(detail['offerings'])}건, "
+                    "선반/등록/공모 관련 공시)"
+                )
+                if detail["offerings"]
+                else "최근 180일 SEC 공시에서 확인 안 됨"
+            )
+            reason_text = (
+                "최근 SEC 자금조달 공시가 있어 상승 재료 가능성은 있으나 "
+                "원인 단정 불가"
+                if detail["offerings"]
+                else "실시간 뉴스 원문 자동조회 범위 밖이라 확인불가"
+            )
+            sector = f"{detail['sector']} / {detail['industry']}"
+            if any(
+                keyword in sector.lower()
+                for keyword in ("biotech", "pharma", "biological")
+            ):
+                sector += " [바이오]"
+            if any(
+                keyword in sector.lower()
+                for keyword in ("energy", "oil", "gas", "renewable")
+            ):
+                sector += " [에너지]"
+            if any(
+                keyword in sector.lower()
+                for keyword in ("aerospace", "defense")
+            ):
+                sector += " [방산]"
+            if "quantum" in sector.lower():
+                sector += " [양자]"
+            if "acquisition" in sector.lower():
+                sector += " [Acquisition]"
+
+            country_text = format_country(item.get("country"))
+            if any(
+                keyword in str(item.get("country"))
+                for keyword in ("호주", "말레이시아", "영국령 버진아일랜드")
+            ):
+                country_text = alert_text(country_text)
+            if "바이오" in sector and "아시아" in str(item.get("country")):
+                country_text = alert_text(country_text)
+            market_text = item.get("market") or "-"
+            if "AMEX" in market_text.upper() or "NYSE AMERICAN" in market_text.upper():
+                market_text = alert_text(f"{market_text} (AMEX 별도분류)")
+            low_volume = (
+                detail.get("previous_volume") is not None
+                and float(detail["previous_volume"]) < 1_000_000
+            )
+            flags = []
+            if low_volume:
+                flags.append(alert_text("전일 거래량 100만 이하"))
+            if detail["half_move"]:
+                flags.append(alert_text("최근 3거래일 내 일간 +50%"))
+            if detail["delisting_warning"]:
+                flags.append(alert_text("상폐/공시기한 경고 가능성"))
+            if detail["reverse_split"]:
+                flags.append(alert_text("최근 병합/분할 공시 의심"))
+            if detail["david_lazar"]:
+                flags.append(alert_text("David Lazar 문자열 탐지"))
+            if detail["adr"]:
+                flags.append(alert_text("ADR"))
+            if detail["rename"]:
+                flags.append(alert_text("최근 사명변경 공시 의심"))
+            if (
+                "NASDAQ" in str(item.get("market")).upper()
+                and item.get("current_price") is not None
+                and float(item["current_price"]) < 1
+                and any(
+                    keyword in f"{item.get('name')} {item.get('country')}"
+                    for keyword in ("한국", "대한민국", "Korea", "Korean")
+                )
+            ):
+                flags.append(alert_text("나스닥 1달러 조건 + 한국 관련"))
+            if "중국" in str(item.get("country")) and (
+                detail["market_cap"] is not None
+                and detail["market_cap"] < 300_000_000
+            ):
+                flags.append(alert_text("차이나 스몰캡 함정 패턴 점검"))
+
+            lines.extend(
+                [
+                    alert_text(f"{item['symbol']} | {item['name']}"),
+                    f"국적 {country_text} | 거래소 {market_text}",
+                    f"등락 {change_text} | "
+                    f"현재가 {fmt_price(item.get('current_price'))}",
+                    f"거래량 {fmt_volume(item.get('trading_volume'))}",
+                    f"오늘 오른 이유: {reason_text}",
+                    f"시총 {market_cap_text} | 분야 {sector}",
+                    f"1주 {detail['week_change'] if detail['week_change'] is not None else '확인불가'}% | "
+                    f"1개월 {detail['month_change'] if detail['month_change'] is not None else '확인불가'}%",
+                    f"상장일 {detail['listing_date'] or '확인불가'} | "
+                    f"현금 런웨이 {detail['runway']}",
+                    f"최근 오퍼링/선반/ATM: {offering_text}",
+                    f"최근 병합·분할: {'확인됨' if detail['reverse_split'] else '확인 안 됨'} | "
+                    "병합 전날 급등: 가격·공시 날짜 대조 필요",
+                    f"법적문제/벌금: "
+                    f"{detail['legal_issue'] or alert_text('확인불가')}",
+                    f"가까운 중요발표·경쟁사 발표: 공개 캘린더 자동조회 {alert_text('확인불가')}",
+                    f"주의 플래그: {' / '.join(flags) if flags else '특이 플래그 없음'}",
+                    "",
+                ]
+            )
+
+    print()
+    print("=" * 120)
+    print("\n".join(lines))
+    print("=" * 120)
+    print(
+        f"✅ 케이맨제도 상세분석 터미널 출력 완료: "
+        f"{len(cayman_items)}개"
+    )
+
+
+def send_minute_drop_alert(items):
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not bot_token or not chat_id:
+        print("❌ 텔레그램 설정이 없습니다.")
+        return
+
+    lines = ["🚨 1분 급락 감지", ""]
+    for item in items:
+        lines.append(
+            f"{item['symbol']} | {item['name']} | "
+            f"{item['change_percent']:.2f}% | "
+            f"시가 {fmt_price(item['open_price'])} → "
+            f"저가 {fmt_price(item['low_price'])} → "
+            f"종가 {fmt_price(item['current_close'])} | "
+            f"거래량 {fmt_volume(item['volume'])}"
+        )
+
+    message = "\n".join(lines)
+    print()
+    print("=" * 100)
+    print(message)
+    print("=" * 100)
+
+    response = requests.post(
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        data={
+            "chat_id": chat_id,
+            "text": message,
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    print(f"✅ 1분 급락 텔레그램 전송 완료: {len(items)}개")
+
+
+def minute_drop_alert_mode(token):
+    current_day = None
+    last_checked_minute = None
+    lowest_since_session_start = {}
+    KST = timezone(timedelta(hours=9))
+
+    while True:
+        now = datetime.now(KST)
+        session_day = now.date()
+        if current_day != session_day:
+            current_day = session_day
+            last_checked_minute = None
+            lowest_since_session_start.clear()
+
+        is_formula_window = 9 <= now.hour <= 16
+        if not is_formula_window:
+            time.sleep(30)
+            continue
+
+        rankings = get_top100(token)
+        detected = []
+        current_minute = now.replace(
+            second=0,
+            microsecond=0,
+        )
+        session_start_minute = now.replace(
+            hour=9,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if current_minute < session_start_minute:
+            time.sleep(1)
+            continue
+        if current_minute == last_checked_minute:
+            time.sleep(1)
+            continue
+        last_checked_minute = current_minute
+
+        for ranking in rankings:
+            if not isinstance(ranking, dict):
+                continue
+
+            symbol = (
+                ranking.get("symbol")
+                or ranking.get("ticker")
+                or ranking.get("code")
+            )
+            if not symbol:
+                continue
+
+            symbol = str(symbol).upper()
+
+            current = get_0830_candle(
+                token,
+                symbol,
+                current_minute,
+                max_fallback=0,
+            )
+            if not current:
+                continue
+
+            open_price = current.get("open")
+            low_price = current.get("low")
+            current_close = current.get("close")
+            volume = current.get("volume")
+            if (
+                open_price is None
+                or low_price is None
+                or not current_close
+                or volume is None
+            ):
+                continue
+
+            change_percent = (
+                (current_close - open_price)
+                / open_price
+                * 100
+            )
+            is_session_start = current_minute == session_start_minute
+            if is_session_start:
+                lowest_since_session_start[symbol] = low_price
+                near_session_low = current_close <= low_price * 1.01
+            else:
+                previous_low = lowest_since_session_start.get(symbol)
+                if previous_low is None:
+                    near_session_low = False
+                    lowest_since_session_start[symbol] = low_price
+                else:
+                    near_session_low = low_price <= previous_low * 1.01
+                    lowest_since_session_start[symbol] = min(previous_low, low_price)
+
+            formula_matches = (
+                current_close < open_price * 0.96
+                and near_session_low
+                and (
+                    current_close > 0.5
+                    or volume >= 1000
+                )
+            )
+
+            if formula_matches:
+                detected.append(
+                    {
+                        "symbol": symbol,
+                        "name": (
+                            ranking.get("name")
+                            or ranking.get("stockName")
+                            or ""
+                        ),
+                        "open_price": open_price,
+                        "low_price": low_price,
+                        "current_close": current_close,
+                        "volume": volume,
+                        "change_percent": change_percent,
+                    }
+                )
+
+        if detected:
+            send_minute_drop_alert(detected)
+
+        time.sleep(60)
+
+
+# ============================================================
+# 삼신기(RSI/ADX) 신호 계산 — 삼신기.py 로직 병합
+# ============================================================
+
+def samsingi_mean(values):
+    return sum(values) / len(values) if values else None
+
+
+def samsingi_ema(values, period):
+    result = [None] * len(values)
+    previous = None
+    alpha = 2 / (period + 1)
+    for index, value in enumerate(values):
+        if value is None:
+            continue
+        previous = (
+            value if previous is None
+            else previous + alpha * (value - previous)
+        )
+        result[index] = previous
+    return result
+
+
+def samsingi_rolling_mean(values, index, period):
+    if index + 1 < period:
+        return None
+    return samsingi_mean(values[index - period + 1 : index + 1])
+
+
+def samsingi_rolling_std(values, index, period):
+    if index + 1 < period:
+        return None
+    window = values[index - period + 1 : index + 1]
+    average = samsingi_mean(window)
+    return math.sqrt(
+        sum((value - average) ** 2 for value in window) / (period - 1)
+    )
+
+
+def samsingi_get_candles(token, symbol, before, start):
+    candles = []
+    cursor = (
+        before.isoformat() if isinstance(before, datetime) else before
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    while True:
+        response = requests.get(
+            f"{BASE_URL}/api/v1/candles",
+            headers=headers,
+            params={
+                "symbol": symbol,
+                "interval": "1m",
+                "count": 200,
+                "before": cursor,
+                "adjusted": True,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        result = response.json().get("result", {})
+        batch = result.get("candles", []) if isinstance(result, dict) else []
+        if not batch:
+            break
+
+        for item in batch:
+            try:
+                timestamp = datetime.fromisoformat(item["timestamp"])
+                if timestamp >= start:
+                    candles.append(
+                        {
+                            "timestamp": timestamp,
+                            "open": float(item["openPrice"]),
+                            "high": float(item["highPrice"]),
+                            "low": float(item["lowPrice"]),
+                            "close": float(item["closePrice"]),
+                            "volume": float(item["volume"]),
+                        }
+                    )
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        oldest = min(
+            datetime.fromisoformat(x["timestamp"]) for x in batch
+        )
+        if oldest < start:
+            break
+        next_before = result.get("nextBefore")
+        if not next_before or next_before == cursor:
+            break
+        cursor = next_before
+
+    unique = {item["timestamp"]: item for item in candles}
+    return sorted(unique.values(), key=lambda item: item["timestamp"])
+
+
+def samsingi_calculate_conditions(candles):
+    high = [item["high"] for item in candles]
+    low = [item["low"] for item in candles]
+    close = [item["close"] for item in candles]
+    volume = [item["volume"] for item in candles]
+    period = 20
+
+    true_range = []
+    plus_dm = []
+    minus_dm = []
+    for index in range(len(candles)):
+        previous_close = close[index - 1] if index else close[index]
+        true_range.append(
+            max(
+                high[index] - low[index],
+                abs(high[index] - previous_close),
+                abs(low[index] - previous_close),
+            )
+        )
+        if not index:
+            plus_dm.append(0)
+            minus_dm.append(0)
+            continue
+        upward = high[index] - high[index - 1]
+        downward = low[index - 1] - low[index]
+        plus_dm.append(
+            upward if upward > downward and upward > 0 else 0
+        )
+        minus_dm.append(
+            downward if downward > upward and downward > 0 else 0
+        )
+
+    atr = samsingi_ema(true_range, period)
+    plus = samsingi_ema(plus_dm, period)
+    minus = samsingi_ema(minus_dm, period)
+    di_plus = [
+        100 * plus[i] / atr[i] if atr[i] else None
+        for i in range(len(candles))
+    ]
+    di_minus = [
+        100 * minus[i] / atr[i] if atr[i] else None
+        for i in range(len(candles))
+    ]
+    dx = [
+        100 * abs(di_plus[i] - di_minus[i]) / (di_plus[i] + di_minus[i])
+        if di_plus[i] is not None
+        and di_minus[i] is not None
+        and di_plus[i] + di_minus[i]
+        else None
+        for i in range(len(candles))
+    ]
+    adx = samsingi_ema(dx, period)
+
+    changes = [None] + [
+        close[i] - close[i - 1] for i in range(1, len(close))
+    ]
+    gains = [
+        max(change, 0) if change is not None else None
+        for change in changes
+    ]
+    losses = [
+        max(-change, 0) if change is not None else None
+        for change in changes
+    ]
+    average_gain = samsingi_ema(gains, 14)
+    average_loss = samsingi_ema(losses, 14)
+    rsi = [
+        100 - 100 / (1 + average_gain[i] / average_loss[i])
+        if average_gain[i] is not None and average_loss[i]
+        else None
+        for i in range(len(candles))
+    ]
+
+    stochastic_raw = []
+    for index in range(len(candles)):
+        if index < period - 1:
+            stochastic_raw.append(None)
+            continue
+        lowest = min(low[index - period + 1 : index + 1])
+        highest = max(high[index - period + 1 : index + 1])
+        stochastic_raw.append(
+            100 * (close[index] - lowest) / (highest - lowest)
+            if highest != lowest
+            else None
+        )
+
+    result = []
+    for index in range(len(candles)):
+        stoch = (
+            samsingi_mean(
+                stochastic_raw[index - period + 1 : index + 1]
+            )
+            if index >= 2 * period - 2
+            and all(
+                value is not None
+                for value in stochastic_raw[index - period + 1 : index + 1]
+            )
+            else None
+        )
+        middle = samsingi_rolling_mean(close, index, period)
+        deviation = samsingi_rolling_std(close, index, period)
+        volume_average = samsingi_rolling_mean(volume, index, period)
+        highest_5 = (
+            max(high[index - 4 : index + 1]) if index >= 4 else None
+        )
+        values = [
+            rsi[index], adx[index], di_plus[index], di_minus[index],
+            stoch, middle, deviation, volume_average, highest_5,
+        ]
+        current = all(value is not None for value in values) and (
+            rsi[index] <= 25
+            and adx[index] > 35
+            and di_plus[index] < di_minus[index]
+            and di_minus[index] - di_plus[index] >= 40
+            and di_minus[index] >= 45
+            and stoch <= 15
+            and volume[index] > volume_average * 2
+            and close[index] < middle - 2 * deviation
+            and close[index] < highest_5 * 0.98
+        )
+        result.append(current)
+    return result
+
+
+def samsingi_scan_live_symbol(token, symbol, session_start, now):
+    candles = samsingi_get_candles(
+        token,
+        symbol,
+        now.replace(second=0, microsecond=0) + timedelta(minutes=1),
+        now - timedelta(hours=24),
+    )
+    if len(candles) < 50:
+        return None
+
+    reference_candles = samsingi_get_candles(
+        token,
+        symbol,
+        session_start + timedelta(minutes=1),
+        session_start,
+    )
+    reference = next(
+        (
+            item for item in reference_candles
+            if item["timestamp"] == session_start
+        ),
+        None,
+    )
+    if reference is None:
+        return None
+
+    conditions = samsingi_calculate_conditions(candles)
+    index = len(candles) - 1
+    if index < 1 or not (conditions[index] and conditions[index - 1]):
+        return None
+
+    signal = candles[index]
+    if signal["close"] >= reference["close"]:
+        return None
+
+    return {
+        "symbol": symbol,
+        "time": signal["timestamp"].isoformat(),
+        "entry": signal["close"],
+        "reference_0830": reference["close"],
+        "below_reference_percent": (
+            signal["close"] / reference["close"] - 1
+        ) * 100,
+        "highest_10m": signal["high"],
+        "return_percent": 0,
+        "entry_volume": signal["volume"],
+    }
+
+
+def send_samsingi_alert(signals):
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not bot_token or not chat_id:
+        print("❌ 텔레그램 설정이 없습니다.")
+        return
+
+    lines = ["🚨 삼신기 조건 신호", ""]
+    for signal in sorted(signals, key=lambda item: item["time"]):
+        lines.append(
+            f"{signal['time']} {signal['symbol']} | "
+            f"매수 {signal['entry']:.6f} | "
+            f"08:30 대비 {signal['below_reference_percent']:.2f}% | "
+            f"거래량 {signal['entry_volume']:.0f}"
+        )
+
+    message = "\n".join(lines)
+    print()
+    print("=" * 100)
+    print(message)
+    print("=" * 100)
+
+    response = requests.post(
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        data={
+            "chat_id": chat_id,
+            "text": message,
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    print(f"✅ 삼신기 신호 텔레그램 전송 완료: {len(signals)}건")
+
+
+# ============================================================
+# 통합 실시간 감시 (분봉급락 + 삼신기, 토큰 1개 공유)
+# ============================================================
+
+def combined_alert_mode(token):
+    """분봉급락 알림과 삼신기 신호를 하나의 루프(토큰 1개)로 동시 감시한다."""
+    KST = timezone(timedelta(hours=9))
+    current_day = None
+    last_checked_minute = None
+    lowest_since_session_start = {}
+    sent_samsingi_signals = set()
+
+    print()
+    print("=" * 100)
+    print("통합 실시간 감시 시작 (분봉급락 + 삼신기)")
+    print("=" * 100)
+
+    while True:
+        now = datetime.now(KST)
+        session_day = now.date()
+        if current_day != session_day:
+            current_day = session_day
+            last_checked_minute = None
+            lowest_since_session_start.clear()
+            sent_samsingi_signals.clear()
+
+        is_formula_window = 9 <= now.hour <= 16
+        if not is_formula_window:
+            time.sleep(30)
+            continue
+
+        current_minute = now.replace(second=0, microsecond=0)
+        session_start_minute = now.replace(
+            hour=9, minute=0, second=0, microsecond=0
+        )
+        if current_minute < session_start_minute:
+            time.sleep(1)
+            continue
+        if current_minute == last_checked_minute:
+            time.sleep(1)
+            continue
+        last_checked_minute = current_minute
+
+        rankings = get_top100(token)
+
+        # ---- 1) 분봉 급락 감지 ----
+        detected = []
+        for ranking in rankings:
+            if not isinstance(ranking, dict):
+                continue
+
+            symbol = (
+                ranking.get("symbol")
+                or ranking.get("ticker")
+                or ranking.get("code")
+            )
+            if not symbol:
+                continue
+            symbol = str(symbol).upper()
+
+            current = get_0830_candle(
+                token, symbol, current_minute, max_fallback=0
+            )
+            if not current:
+                continue
+
+            open_price = current.get("open")
+            low_price = current.get("low")
+            current_close = current.get("close")
+            volume = current.get("volume")
+            if (
+                open_price is None
+                or low_price is None
+                or not current_close
+                or volume is None
+            ):
+                continue
+
+            change_percent = (
+                (current_close - open_price) / open_price * 100
+            )
+            is_session_start = current_minute == session_start_minute
+            if is_session_start:
+                lowest_since_session_start[symbol] = low_price
+                near_session_low = current_close <= low_price * 1.01
+            else:
+                previous_low = lowest_since_session_start.get(symbol)
+                if previous_low is None:
+                    near_session_low = False
+                    lowest_since_session_start[symbol] = low_price
+                else:
+                    near_session_low = low_price <= previous_low * 1.01
+                    lowest_since_session_start[symbol] = min(
+                        previous_low, low_price
+                    )
+
+            formula_matches = (
+                current_close < open_price * 0.96
+                and near_session_low
+                and (
+                    current_close > 0.5
+                    or volume >= 1000
+                )
+            )
+            if formula_matches:
+                detected.append(
+                    {
+                        "symbol": symbol,
+                        "name": (
+                            ranking.get("name")
+                            or ranking.get("stockName")
+                            or ""
+                        ),
+                        "open_price": open_price,
+                        "low_price": low_price,
+                        "current_close": current_close,
+                        "volume": volume,
+                        "change_percent": change_percent,
+                    }
+                )
+
+        if detected:
+            send_minute_drop_alert(detected)
+
+        # ---- 2) 삼신기 신호 감지 ----
+        symbols = list(
+            dict.fromkeys(
+                str(
+                    item.get("symbol")
+                    or item.get("ticker")
+                    or item.get("code")
+                ).upper()
+                for item in rankings
+                if isinstance(item, dict)
+                and (
+                    item.get("symbol")
+                    or item.get("ticker")
+                    or item.get("code")
+                )
+            )
+        )
+
+        samsingi_reference_time = session_start_minute.replace(
+            hour=8, minute=30
+        )
+        samsingi_detected = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [
+                executor.submit(
+                    samsingi_scan_live_symbol,
+                    token,
+                    symbol,
+                    samsingi_reference_time,
+                    now,
+                )
+                for symbol in symbols
+            ]
+            for future in as_completed(futures):
+                signal = future.result()
+                if not signal:
+                    continue
+                signal_id = (signal["symbol"], signal["time"])
+                if signal_id in sent_samsingi_signals:
+                    continue
+                sent_samsingi_signals.add(signal_id)
+                samsingi_detected.append(signal)
+                print(
+                    f"삼신기 신호 {signal['time']} {signal['symbol']} "
+                    f"매수 {signal['entry']:.6f} "
+                    f"08:30 대비 "
+                    f"{signal['below_reference_percent']:.2f}%"
+                )
+
+        if samsingi_detected:
+            send_samsingi_alert(samsingi_detected)
+
+        time.sleep(max(1, 60 - datetime.now().second))
+
+
 # ============================================================
 # ISIN 국가코드
 # ============================================================
@@ -108,6 +1292,7 @@ COUNTRY_CODES = {
     "BR": "🇧🇷 브라질",
     "MX": "🇲🇽 멕시코",
     "DE": "🇩🇪 독일",
+    "BE": "🇧🇪 벨기에",
     "FR": "🇫🇷 프랑스",
     "CH": "🇨🇭 스위스",
     "NL": "🇳🇱 네덜란드",
@@ -115,6 +1300,7 @@ COUNTRY_CODES = {
     "LU": "🇱🇺 룩셈부르크",
     "BM": "🇧🇲 버뮤다",
     "KY": "🇰🇾 케이맨제도",
+    "MH": "🇲🇭 마셜제도",
     "VG": "🇻🇬 영국령 버진아일랜드",
     "PA": "🇵🇦 파나마",
     "ZA": "🇿🇦 남아프리카공화국",
@@ -1073,7 +2259,8 @@ def get_0830_trade(
 def get_0830_candle(
     token,
     symbol,
-    target_time
+    target_time,
+    max_fallback=10,
 ):
 
     url = f"{BASE_URL}/api/v1/candles"
@@ -1086,7 +2273,7 @@ def get_0830_candle(
     # 08:30 → 08:29 → ... → 08:20
     for minute_back in range(
         0,
-        11
+        max_fallback + 1
     ):
 
         search_time = (
@@ -1204,12 +2391,25 @@ def get_0830_candle(
                     continue
 
                 close_price = (
-
                     candle.get("close")
-
                     or candle.get(
                         "closePrice"
                     )
+                )
+
+                open_price = (
+                    candle.get("open")
+                    or candle.get(
+                        "openPrice"
+                    )
+                )
+                volume = (
+                    candle.get("volume")
+                    or candle.get("tradingVolume")
+                )
+                low_price = (
+                    candle.get("low")
+                    or candle.get("lowPrice")
                 )
 
                 if close_price is None:
@@ -1219,6 +2419,22 @@ def get_0830_candle(
 
                     close_price = float(
                         close_price
+                    )
+
+                    open_price = (
+                        float(open_price)
+                        if open_price is not None
+                        else None
+                    )
+                    volume = (
+                        float(volume)
+                        if volume is not None
+                        else None
+                    )
+                    low_price = (
+                        float(low_price)
+                        if low_price is not None
+                        else None
                     )
 
                 except Exception:
@@ -1232,6 +2448,13 @@ def get_0830_candle(
 
                     "close":
                         close_price,
+
+                    "open":
+                        open_price,
+                    "volume":
+                        volume,
+                    "low":
+                        low_price,
 
                     "fallback_minutes":
                         minute_back,
@@ -1391,21 +2614,14 @@ def print_0830_header():
 
     print(
 
-        f"{'순위':>4}  "
-
-        f"{'티커':<9}  "
-
-        f"{'종목명':<30}  "
-
-        f"{'국적':<24}  "
-
-        f"{'기준시간':<10}  "
-
-        f"{'08:30 기준가격':>15}  "
-
-        f"{'현재가':>15}  "
-
-        f"{'등락률':>11}"
+        f"{fit_cell('순위', 4, 'right')}  "
+        f"{fit_cell('티커', 9)}  "
+        f"{fit_cell('종목명', 30)}  "
+        f"{fit_cell('국적', 24)}  "
+        f"{fit_cell('기준시간', 10)}  "
+        f"{fit_cell('08:30 기준가격', 15, 'right')}  "
+        f"{fit_cell('현재가', 15, 'right')}  "
+        f"{fit_cell('등락률', 11, 'right')}"
     )
 
     print("-" * 140)
@@ -1422,7 +2638,7 @@ def print_0830_row(
 
     symbol = item["symbol"]
 
-    name = item["name"]
+    name = format_stock_name(item["name"])
 
     country = format_country(
         item["country"]
@@ -1493,21 +2709,14 @@ def print_0830_row(
 
     print(
 
-        f"{index:>4}  "
-
-        f"{symbol:<9}  "
-
-        f"{name[:30]:<30}  "
-
-        f"{country:<24}  "
-
-        f"{ref_time:<10}  "
-
-        f"{fmt_reference_price(reference_price):>15}  "
-
-        f"{fmt_price(current_price):>15}  "
-
-        f"{change_str}"
+        f"{fit_cell(index, 4, 'right')}  "
+        f"{fit_cell(symbol, 9)}  "
+        f"{fit_cell(name, 30)}  "
+        f"{fit_cell(country, 24)}  "
+        f"{fit_cell(ref_time, 10)}  "
+        f"{fit_cell(fmt_reference_price(reference_price), 15, 'right')}  "
+        f"{fit_cell(fmt_price(current_price), 15, 'right')}  "
+        f"{fit_cell(change_str, 11, 'right')}"
     )
 
 
@@ -1573,7 +2782,12 @@ def print_top20(
 # 메인
 # ============================================================
 
-def main():
+def main(
+    send_alert=False,
+    minute_drop_alert=False,
+    cayman_alert=False,
+    combined_alert=False,
+):
 
     print()
     print("=" * 140)
@@ -1603,6 +2817,14 @@ def main():
     token = get_access_token()
 
     if not token:
+        return
+
+    if minute_drop_alert:
+        minute_drop_alert_mode(token)
+        return
+
+    if combined_alert:
+        combined_alert_mode(token)
         return
 
     # --------------------------------------------------------
@@ -2070,6 +3292,12 @@ def main():
             )
     )
 
+    if send_alert:
+        send_drop_alert(results, token, target_time)
+
+    if cayman_alert:
+        print_cayman_report(results)
+
     # --------------------------------------------------------
     # TOP100
     # --------------------------------------------------------
@@ -2234,4 +3462,9 @@ def main():
 
 if __name__ == "__main__":
 
-    main()
+    main(
+        send_alert="--telegram-alert" in sys.argv[1:],
+        minute_drop_alert="--minute-drop-alert" in sys.argv[1:],
+        cayman_alert="--cayman-alert" in sys.argv[1:],
+        combined_alert="--combined-alert" in sys.argv[1:],
+    )
