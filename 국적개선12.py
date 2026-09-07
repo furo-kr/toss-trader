@@ -828,7 +828,7 @@ def samsingi_rolling_std(values, index, period):
     )
 
 
-def samsingi_get_candles(token, symbol, before, start):
+def samsingi_get_candles(token, symbol, before, start, count=200):
     candles = []
     cursor = (
         before.isoformat() if isinstance(before, datetime) else before
@@ -836,19 +836,36 @@ def samsingi_get_candles(token, symbol, before, start):
     headers = {"Authorization": f"Bearer {token}"}
 
     while True:
-        response = requests.get(
-            f"{BASE_URL}/api/v1/candles",
-            headers=headers,
-            params={
-                "symbol": symbol,
-                "interval": "1m",
-                "count": 200,
-                "before": cursor,
-                "adjusted": True,
-            },
-            timeout=20,
-        )
-        response.raise_for_status()
+        response = None
+        for attempt in range(4):
+            try:
+                response = requests.get(
+                    f"{BASE_URL}/api/v1/candles",
+                    headers=headers,
+                    params={
+                        "symbol": symbol,
+                        "interval": "1m",
+                        "count": count,
+                        "before": cursor,
+                        "adjusted": True,
+                    },
+                    timeout=20,
+                )
+                response.raise_for_status()
+                break
+            except requests.exceptions.HTTPError as error:
+                if (
+                    response is not None
+                    and response.status_code == 429
+                    and attempt + 1 < 4
+                ):
+                    time.sleep(2 ** attempt)
+                    continue
+                raise
+            except requests.exceptions.RequestException:
+                if attempt + 1 == 4:
+                    raise
+                time.sleep(2 ** attempt)
         result = response.json().get("result", {})
         batch = result.get("candles", []) if isinstance(result, dict) else []
         if not batch:
@@ -1009,30 +1026,16 @@ def samsingi_calculate_conditions(candles):
     return result
 
 
-def samsingi_scan_live_symbol(token, symbol, session_start, now):
+def samsingi_scan_live_symbol(token, symbol, reference_close, now):
+    """삼신기 라이브 스캔. reference_close는 08:30 종가(미리 캐시된 값)."""
     candles = samsingi_get_candles(
         token,
         symbol,
         now.replace(second=0, microsecond=0) + timedelta(minutes=1),
-        now - timedelta(hours=24),
+        now - timedelta(hours=2),
+        count=60,
     )
     if len(candles) < 50:
-        return None
-
-    reference_candles = samsingi_get_candles(
-        token,
-        symbol,
-        session_start + timedelta(minutes=1),
-        session_start,
-    )
-    reference = next(
-        (
-            item for item in reference_candles
-            if item["timestamp"] == session_start
-        ),
-        None,
-    )
-    if reference is None:
         return None
 
     conditions = samsingi_calculate_conditions(candles)
@@ -1041,16 +1044,16 @@ def samsingi_scan_live_symbol(token, symbol, session_start, now):
         return None
 
     signal = candles[index]
-    if signal["close"] >= reference["close"]:
+    if signal["close"] >= reference_close:
         return None
 
     return {
         "symbol": symbol,
         "time": signal["timestamp"].isoformat(),
         "entry": signal["close"],
-        "reference_0830": reference["close"],
+        "reference_0830": reference_close,
         "below_reference_percent": (
-            signal["close"] / reference["close"] - 1
+            signal["close"] / reference_close - 1
         ) * 100,
         "highest_10m": signal["high"],
         "return_percent": 0,
@@ -1104,6 +1107,7 @@ def combined_alert_mode(token):
     last_checked_minute = None
     lowest_since_session_start = {}
     sent_samsingi_signals = set()
+    reference_0830_cache = {}  # symbol -> 08:30 종가 (하루 1회만 조회)
 
     print()
     print("=" * 100)
@@ -1118,6 +1122,7 @@ def combined_alert_mode(token):
             last_checked_minute = None
             lowest_since_session_start.clear()
             sent_samsingi_signals.clear()
+            reference_0830_cache.clear()
 
         is_formula_window = 9 <= now.hour <= 16
         if not is_formula_window:
@@ -1218,40 +1223,82 @@ def combined_alert_mode(token):
             send_minute_drop_alert(detected)
 
         # ---- 2) 삼신기 신호 감지 ----
-        symbols = list(
-            dict.fromkeys(
-                str(
-                    item.get("symbol")
-                    or item.get("ticker")
-                    or item.get("code")
-                ).upper()
-                for item in rankings
-                if isinstance(item, dict)
-                and (
-                    item.get("symbol")
-                    or item.get("ticker")
-                    or item.get("code")
-                )
-            )
-        )
-
         samsingi_reference_time = session_start_minute.replace(
             hour=8, minute=30
         )
+
+        symbols = []
+        for item in rankings:
+            if not isinstance(item, dict):
+                continue
+            sym = (
+                item.get("symbol")
+                or item.get("ticker")
+                or item.get("code")
+            )
+            if not sym:
+                continue
+            symbols.append(str(sym).upper())
+        symbols = list(dict.fromkeys(symbols))
+
+        # 08:30 기준가격 캐시 채우기 (아직 없는 종목만)
+        missing_ref = [
+            s for s in symbols if s not in reference_0830_cache
+        ]
+        if missing_ref:
+            print(
+                f"08:30 기준가격 캐시 조회: "
+                f"{len(missing_ref)}개 종목"
+            )
+            for symbol in missing_ref:
+                try:
+                    ref_candles = samsingi_get_candles(
+                        token,
+                        symbol,
+                        samsingi_reference_time + timedelta(minutes=1),
+                        samsingi_reference_time,
+                        count=5,
+                    )
+                    ref = next(
+                        (
+                            c for c in ref_candles
+                            if c["timestamp"] == samsingi_reference_time
+                        ),
+                        None,
+                    )
+                    if ref:
+                        reference_0830_cache[symbol] = ref["close"]
+                except Exception as error:
+                    print(
+                        f"⚠️ 08:30 기준가격 조회 실패 "
+                        f"({symbol}): {error}"
+                    )
+
         samsingi_detected = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [
-                executor.submit(
-                    samsingi_scan_live_symbol,
-                    token,
-                    symbol,
-                    samsingi_reference_time,
-                    now,
-                )
-                for symbol in symbols
-            ]
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {}
+            for symbol in symbols:
+                ref_close = reference_0830_cache.get(symbol)
+                if ref_close is None:
+                    continue
+                futures[
+                    executor.submit(
+                        samsingi_scan_live_symbol,
+                        token,
+                        symbol,
+                        ref_close,
+                        now,
+                    )
+                ] = symbol
             for future in as_completed(futures):
-                signal = future.result()
+                try:
+                    signal = future.result()
+                except Exception as error:
+                    print(
+                        f"⚠️ 삼신기 스캔 실패 "
+                        f"({futures[future]}): {error}"
+                    )
+                    continue
                 if not signal:
                     continue
                 signal_id = (signal["symbol"], signal["time"])
